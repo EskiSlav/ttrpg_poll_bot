@@ -34,23 +34,32 @@ POLL_OPTIONS = [
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        'Привіт! Надішліть будь-яке повідомлення, і я створю опитування для нього.'
+        'Привіт! Використовуйте /poll <текст> або /rate <текст> щоб створити опитування.'
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a poll when any message is received."""
-    user_message = "Оцінка (" + update.message.text + ")"
+async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a poll from /poll or /rate command."""
+    # Get text after the command
+    if not context.args:
+        await update.message.reply_text(
+            'Будь ласка, додайте текст після команди. Наприклад: /poll oblivion'
+        )
+        return
     
-    # Send poll with the user's message as question
-    await update.message.reply_poll(
-        question=user_message,
+    # Join all arguments to create the poll question
+    poll_question = "Оцінка (" + ' '.join(context.args) + ")"
+    
+    # Send poll to the chat (not as a reply)
+    await context.bot.send_poll(
+        chat_id=update.effective_chat.id,
+        question=poll_question,
         options=POLL_OPTIONS,
         is_anonymous=False,  # Poll is not anonymous
         allows_multiple_answers=False
     )
     
-    logger.info(f"Poll created for: {user_message}")
+    logger.info(f"Poll created by {update.effective_user.username}: {poll_question}")
 
 
 def main() -> None:
@@ -70,7 +79,8 @@ def main() -> None:
     
     # Register handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("poll", create_poll))
+    application.add_handler(CommandHandler("rate", create_poll))
     
     # Start the Bot
     logger.info("Bot is starting...")
