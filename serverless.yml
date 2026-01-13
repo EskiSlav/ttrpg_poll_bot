@@ -1,0 +1,61 @@
+service: telegram-poll-bot
+
+frameworkVersion: '4.30.0'
+
+provider:
+  name: aws
+  runtime: python3.14
+  region: ${opt:region, 'eu-west-2'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 30
+  
+  environment:
+    TELEGRAM_TOKEN_SSM_PARAMETER: ${self:custom.ssmParameter}
+  
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+          Resource:
+            - arn:aws:ssm:${aws:region}:${aws:accountId}:parameter${self:custom.ssmParameter}
+
+custom:
+  ssmParameter: /telegram/poll_bot/token
+  # Configures throttling settings for the API Gateway stage
+  # They apply to all http endpoints, unless specifically overridden
+  apiGatewayThrottling:
+    maxRequestsPerSecond: 20
+    maxConcurrentRequests: 10
+functions:
+  webhook:
+    handler: lambda_handler.lambda_handler
+    # reservedConcurrency: 10  # Limit concurrent executions
+    events:
+      - httpApi:
+          path: /webhook
+          method: post
+          throttling:
+            maxRequestsPerSecond: 10  # 10 requests per second = ~600/min
+            maxConcurrentRequests: 5
+      - httpApi:
+          path: /webhook
+          method: get
+          throttling:
+            maxRequestsPerSecond: 10
+            maxConcurrentRequests: 5
+
+plugins:
+  - serverless-python-requirements
+  - serverless-api-gateway-throttling
+
+package:
+  exclude:
+    - venv/**
+    - node_modules/**
+    - .git/**
+    - .gitignore
+    - README.md
+    - main.py
