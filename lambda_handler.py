@@ -15,7 +15,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Poll options
-POLL_OPTIONS = [
+RATING_OPTIONS = [
     "Подивитись відповідь",
     "1 / 10 🤬",
     "2 / 10 😡",
@@ -27,6 +27,11 @@ POLL_OPTIONS = [
     "8 / 10 ☺️",
     "9 / 10 🤩",
     "10 / 10 🌟🌟🌟"
+]
+
+BOOL_OPTIONS = [
+    "Так",
+    "Ні"
 ]
 
 
@@ -158,7 +163,9 @@ def handle_start_command(bot: Bot, update: Update):
     """Handle /start command."""
     bot.send_message(
         update.message.chat.id,
-        'Привіт! Використовуйте /poll <текст> або /rate <текст> щоб створити опитування.'
+        'Привіт!\n'
+        '/poll <текст> або /rate <текст> - створити опитування з оцінками 1-10\n'
+        '/bool <питання> - створити опитування Так/Ні'
     )
 
 
@@ -180,12 +187,35 @@ def handle_poll_command(bot: Bot, update: Update):
     bot.send_poll(
         chat_id=update.message.chat.id,
         question=poll_question,
-        options=POLL_OPTIONS,
+        options=RATING_OPTIONS,
         is_anonymous=False,
         allows_multiple_answers=False
     )
     
     logger.info(f"Poll created by {update.message.from_user.username}: {poll_question}")
+
+
+def handle_bool_command(bot: Bot, update: Update):
+    """Handle /bool command."""
+    args = update.message.get_command_args()
+    
+    if not args:
+        bot.send_message(
+            update.message.chat.id,
+            'Будь ласка, додайте питання після команди. Наприклад: /bool Це правда?'
+        )
+        return
+    
+    # Send poll with Yes/No options
+    bot.send_poll(
+        chat_id=update.message.chat.id,
+        question=args,
+        options=BOOL_OPTIONS,
+        is_anonymous=False,
+        allows_multiple_answers=False
+    )
+    
+    logger.info(f"Bool poll created by {update.message.from_user.username}: {args}")
 
 
 def update_handler(update: Update):
@@ -203,6 +233,8 @@ def update_handler(update: Update):
         handle_start_command(bot, update)
     elif command in ['/poll', '/rate']:
         handle_poll_command(bot, update)
+    elif command == '/bool':
+        handle_bool_command(bot, update)
     else:
         # Unknown command or regular message - ignore
         logger.debug(f"Ignoring message: {update.message.text}")

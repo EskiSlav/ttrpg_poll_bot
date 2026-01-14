@@ -4,10 +4,11 @@ A simple Telegram bot that creates rating polls from any message.
 
 ## Features
 
-- Receives any text message
-- Creates a non-anonymous poll with rating options (1-10)
-- Uses emojis for each rating level
-- First option is "Подивитись відповідь"
+- `/poll` or `/rate` commands create rating polls (1-10)
+- `/bool` command creates Yes/No polls
+- All polls are non-anonymous
+- Rating polls use emojis for each level
+- First option in rating polls is "Подивитись відповідь"
 
 ## Setup
 
@@ -33,10 +34,17 @@ python3 main.py
 
 ## Usage
 
-1. Start the bot with `/start` command
-2. Send any message (e.g., "oblivion")
-3. Bot will create a poll with that message as the question
-4. Poll shows rating options from 1/10 to 10/10 with emojis
+### Rating Polls
+
+1. Use `/poll <text>` or `/rate <text>`
+2. Example: `/poll oblivion`
+3. Bot creates a poll with rating options 1-10
+
+### Yes/No Polls
+
+1. Use `/bool <question>`
+2. Example: `/bool Це правда?`
+3. Bot creates a poll with "Так" and "Ні" options
 
 ## Poll Options
 

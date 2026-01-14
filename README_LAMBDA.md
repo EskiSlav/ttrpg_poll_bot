@@ -66,9 +66,9 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
 
 ## Usage
 
-Same as before:
-- `/poll <text>` - Create a poll
-- `/rate <text>` - Create a poll
+- `/poll <text>` - Create a rating poll (1-10)
+- `/rate <text>` - Create a rating poll (1-10)
+- `/bool <question>` - Create a Yes/No poll
 - `/start` - Show help
 
 ## Configuration
