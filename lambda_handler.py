@@ -71,7 +71,7 @@ class Message:
     def get_command(self) -> str:
         """Extract command from message if present."""
         if self.entities and self.entities[0].get('type') == 'bot_command':
-            return self.text.split()[0]
+            return self.text.split()[0].rstrip('@ttrpgpollbot')
         return ''
 
     def get_command_args(self) -> str:
@@ -237,7 +237,7 @@ def update_handler(update: Update):
         handle_bool_command(bot, update)
     else:
         # Unknown command or regular message - ignore
-        logger.debug(f"Ignoring message: {update.message.text}")
+        logger.info(f"Ignoring message: {update.message.text}")
 
 
 def lambda_handler(event, context):
