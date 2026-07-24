@@ -12,7 +12,8 @@ provider:
   
   environment:
     TELEGRAM_TOKEN_SSM_PARAMETER: ${self:custom.ssmParameter}
-  
+    ADMIN_CHAT_ID: ${self:custom.adminChatId}
+
   iam:
     role:
       statements:
@@ -21,9 +22,25 @@ provider:
             - ssm:GetParameter
           Resource:
             - arn:aws:ssm:${aws:region}:${aws:accountId}:parameter${self:custom.ssmParameter}
+        - Effect: Allow
+          Action:
+            - dynamodb:GetRecords
+            - dynamodb:GetShardIterator
+            - dynamodb:DescribeStream
+            - dynamodb:ListStreams
+          Resource:
+            - ${self:custom.signupRequestsStreamArn}
 
 custom:
   ssmParameter: /telegram/poll_bot/token
+  # Your own numeric Telegram chat ID (or a group's) — where new club signup requests get posted.
+  # Not a secret, so a plain value here (or `--param` at deploy time) is fine.
+  adminChatId: ${param:adminChatId}
+  # Stream ARN of the ttrpg_club_signup_requests DynamoDB table (from the ttrpg_website
+  # repo's aws_infra Terraform). Get it with:
+  #   terraform output -raw dynamodb_table_stream_arn
+  # (run from aws_infra/dynamodb/ttrpg_club_signup_requests)
+  signupRequestsStreamArn: ${param:signupRequestsStreamArn}
   # Configures throttling settings for the API Gateway stage
   # They apply to all http endpoints, unless specifically overridden
   apiGatewayThrottling:
@@ -46,6 +63,15 @@ functions:
           throttling:
             maxRequestsPerSecond: 10
             maxConcurrentRequests: 5
+
+  notifySignup:
+    handler: lambda_handler.notify_new_signup
+    events:
+      - stream:
+          type: dynamodb
+          arn: ${self:custom.signupRequestsStreamArn}
+          startingPosition: LATEST
+          batchSize: 10
 
 plugins:
   - serverless-python-requirements

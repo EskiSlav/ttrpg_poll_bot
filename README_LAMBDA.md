@@ -107,6 +107,31 @@ Don't forget to delete the SSM parameter:
 aws ssm delete-parameter --name "/telegram/poll_bot/token"
 ```
 
+## Club Signup Notifications (`notifySignup`)
+
+A second function, `notifySignup`, is triggered directly by the `ttrpg_club_signup_requests`
+DynamoDB Stream from the separate `ttrpg_website`/`aws_infra` project — it posts a message
+to `ADMIN_CHAT_ID` whenever someone submits a new club membership request. It reuses this
+bot's existing token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
+
+Deploy it (in addition to the token in SSM) by passing two extra params:
+
+```bash
+# Your own numeric Telegram chat ID — see README.md's normal getUpdates instructions,
+# or message the bot and check the chat.id there.
+ADMIN_CHAT_ID=123456789
+
+# From the aws_infra repo: cd dynamodb/ttrpg_club_signup_requests && terraform output -raw dynamodb_table_stream_arn
+STREAM_ARN=arn:aws:dynamodb:eu-west-2:...:table/ttrpg_club_signup_requests/stream/...
+
+serverless deploy --stage prod --region eu-west-2 \
+  --param="adminChatId=$ADMIN_CHAT_ID" \
+  --param="signupRequestsStreamArn=$STREAM_ARN"
+```
+
+If the club's `ttrpg_club_signup_requests` table is ever recreated, its stream ARN changes
+and you'll need to redeploy with the new value.
+
 ## Cost
 
 AWS Lambda free tier includes:
