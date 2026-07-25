@@ -69,6 +69,7 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
 - `/poll <text>` - Create a rating poll (1-10)
 - `/rate <text>` - Create a rating poll (1-10)
 - `/bool <question>` - Create a Yes/No poll
+- `/stats` - Open the club's Telegram Mini App to see your own rating stats
 - `/start` - Show help
 
 ## Configuration
@@ -131,6 +132,44 @@ serverless deploy --stage prod --region eu-west-2 \
 
 If the club's `ttrpg_club_signup_requests` table is ever recreated, its stream ARN changes
 and you'll need to redeploy with the new value.
+
+## Personal Stats Mini App (`/stats`)
+
+Every `/rate` poll is non-anonymous, so Telegram sends this bot a `poll_answer` webhook
+update whenever someone votes — the `webhook` function now records these (who rated
+what, when) into two new DynamoDB tables managed by the `ttrpg_website2`/`aws_infra`
+Terraform: `ttrpg_club_telegram_rating_polls` (which poll_id was rating which text) and
+`ttrpg_club_telegram_rating_votes` (the actual votes). The "Подивитись відповідь" /
+view-results option (index 0) is never stored as a rating.
+
+The `ttrpg_website2` frontend has a standalone Mini App page (`/telegram`) that reads
+Telegram's signed `initData` (proof of identity — no separate login) and calls a new
+`POST /telegram/stats` endpoint on the club's own API to show a user their own rating
+history. That endpoint needs `ssm:GetParameter` on this bot's token (to verify
+`initData`'s signature) and read access to the votes table — both already wired into
+`aws_infra`'s `lambda/ttrpg_club_api` Terraform.
+
+**People who voted don't need to be registered on the club website at all** — stats are
+keyed purely by Telegram user ID, independent of the website's own member accounts.
+
+To make `/stats` actually open the Mini App, you need to register it with @BotFather
+once (Telegram only allows `web_app` inline buttons in private chats, not this bot's
+group chat — so `/stats` instead sends a plain URL button using a `t.me/<bot>/<app>`
+deep link, which works everywhere):
+
+1. Message [@BotFather](https://t.me/botfather): `/newapp`, pick this bot, give it a
+   name/short name (e.g. `stats`), and when asked for the Web App URL, use your
+   deployed site's `/telegram` page — e.g. `https://your-cloudfront-domain/telegram`.
+2. Deploy with the resulting deep link:
+   ```bash
+   serverless deploy --stage prod --region eu-west-2 \
+     --param="adminChatId=$ADMIN_CHAT_ID" \
+     --param="signupRequestsStreamArn=$STREAM_ARN" \
+     --param="miniAppDeepLink=https://t.me/your_bot/stats"
+   ```
+
+Until `miniAppDeepLink` is set, `/stats` replies with a "temporarily unavailable"
+message instead of a broken button.
 
 ## Cost
 

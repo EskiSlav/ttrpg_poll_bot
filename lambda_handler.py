@@ -7,6 +7,8 @@ Simple implementation using Telegram Bot API directly
 import json
 import logging
 import os
+from datetime import datetime, timezone
+
 import boto3
 import requests
 from boto3.dynamodb.types import TypeDeserializer
@@ -87,10 +89,23 @@ class Message:
         return str(self.__dict__)
 
 
+class PollAnswer:
+    def __init__(self, poll_answer: dict) -> None:
+        self.poll_id: str = poll_answer.get('poll_id')
+        self.user = User(poll_answer.get('user', {})) if poll_answer.get('user') else None
+        self.option_ids: list = poll_answer.get('option_ids', [])
+
+    def __repr__(self) -> str:
+        return str(self.__dict__)
+
+
 class Update:
     def __init__(self, update: dict) -> None:
         self.update_id = update.get('update_id')
         self.message = Message(update.get('message', {})) if 'message' in update else None
+        self.poll_answer = (
+            PollAnswer(update.get('poll_answer', {})) if 'poll_answer' in update else None
+        )
 
     def __repr__(self) -> str:
         return str(self.__dict__)
@@ -122,7 +137,13 @@ class Bot:
             logger.error(f"Failed to get SSM parameter {parameter_name}: {e}")
             raise
 
-    def send_message(self, chat_id: int, text: str, message_thread_id: int = None) -> int:
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        message_thread_id: int = None,
+        reply_markup: dict = None,
+    ) -> int:
         """Send text message to chat."""
         url = self.api_url + 'sendMessage'
         json_data = {
@@ -131,11 +152,13 @@ class Bot:
         }
         if message_thread_id is not None:
             json_data['message_thread_id'] = message_thread_id
+        if reply_markup is not None:
+            json_data['reply_markup'] = reply_markup
         logger.debug(f'Sending message: {json_data}')
         response = self.session.post(url=url, json=json_data)
         logger.info(f'Sent message to {chat_id}')
         logger.debug(f'{response.status_code=} {response.text=}')
-        
+
         return response.status_code
 
     def send_poll(
@@ -146,8 +169,8 @@ class Bot:
         is_anonymous: bool = False,
         allows_multiple_answers: bool = False,
         message_thread_id: int = None
-    ) -> int:
-        """Send poll to chat."""
+    ) -> dict:
+        """Send poll to chat. Returns the parsed API response body (has result.poll.id)."""
         url = self.api_url + 'sendPoll'
         json_data = {
             'chat_id': chat_id,
@@ -162,8 +185,23 @@ class Bot:
         response = self.session.post(url=url, json=json_data)
         logger.info(f'Sent poll to {chat_id}: {question}')
         logger.debug(f'{response.status_code=} {response.text=}')
-        
-        return response.status_code
+
+        return response.json()
+
+
+_dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'eu-west-2'))
+
+
+def _rating_polls_table():
+    return _dynamodb.Table(os.environ['TELEGRAM_RATING_POLLS_TABLE'])
+
+
+def _rating_votes_table():
+    return _dynamodb.Table(os.environ['TELEGRAM_RATING_VOTES_TABLE'])
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 _deserializer = TypeDeserializer()
@@ -216,8 +254,41 @@ def handle_start_command(bot: Bot, update: Update):
         update.message.chat.id,
         'Привіт!\n'
         '/poll <текст> або /rate <текст> - створити опитування з оцінками 1-10\n'
-        '/bool <питання> - створити опитування Так/Ні',
+        '/bool <питання> - створити опитування Так/Ні\n'
+        '/stats - переглянути свою особисту статистику оцінок',
         message_thread_id=update.message.message_thread_id
+    )
+
+
+def handle_stats_command(bot: Bot, update: Update):
+    """
+    Handle /stats — opens the club's Telegram Mini App with the user's own rating stats.
+
+    Uses a plain `url` button with a t.me/<bot>/<app> deep link rather than an inline
+    `web_app` button: Telegram only allows `web_app` buttons in private chats with the
+    bot, and this bot operates in a group chat (with topics), so `web_app` buttons here
+    would silently fail. The t.me deep link works everywhere and requires the Mini App
+    to be registered once via @BotFather's /newapp (see README_LAMBDA.md).
+    """
+    deep_link = os.environ.get('MINI_APP_DEEP_LINK')
+    if not deep_link:
+        logger.warning("MINI_APP_DEEP_LINK is not configured — cannot open the mini app")
+        bot.send_message(
+            update.message.chat.id,
+            'Статистика тимчасово недоступна.',
+            message_thread_id=update.message.message_thread_id
+        )
+        return
+
+    bot.send_message(
+        update.message.chat.id,
+        'Натисніть, щоб побачити свою статистику оцінок:',
+        message_thread_id=update.message.message_thread_id,
+        reply_markup={
+            'inline_keyboard': [[
+                {'text': '📊 Моя статистика', 'url': deep_link}
+            ]]
+        }
     )
 
 
@@ -237,7 +308,7 @@ def handle_poll_command(bot: Bot, update: Update):
     poll_question = f"Оцінка ({args})"
 
     # Send poll
-    bot.send_poll(
+    response = bot.send_poll(
         chat_id=update.message.chat.id,
         question=poll_question,
         options=RATING_OPTIONS,
@@ -245,7 +316,24 @@ def handle_poll_command(bot: Bot, update: Update):
         allows_multiple_answers=False,
         message_thread_id=update.message.message_thread_id
     )
-    
+
+    # Remember what this poll_id was rating, so a later poll_answer webhook update
+    # (which only carries poll_id + option_ids, not the question) can make sense of it.
+    poll = (response or {}).get('result', {}).get('poll', {})
+    poll_id = poll.get('id')
+    if poll_id:
+        item = {
+            'pollId': poll_id,
+            'questionText': poll_question,
+            'chatId': update.message.chat.id,
+            'createdAt': _now_iso(),
+        }
+        if update.message.message_thread_id is not None:
+            item['messageThreadId'] = update.message.message_thread_id
+        _rating_polls_table().put_item(Item=item)
+    else:
+        logger.warning(f"sendPoll response had no poll id: {response}")
+
     logger.info(f"Poll created by {update.message.from_user.username}: {poll_question}")
 
 
@@ -274,12 +362,52 @@ def handle_bool_command(bot: Bot, update: Update):
     logger.info(f"Bool poll created by {update.message.from_user.username}: {args}")
 
 
+def handle_poll_answer(update: Update):
+    """
+    Record a vote on a /rate poll (option_ids[0] == 0 is "Подивитись відповідь" —
+    not a real rating, so it's not stored). Silently ignored for polls we didn't
+    create via /rate (e.g. /bool polls) since they're never in the polls table.
+    """
+    answer = update.poll_answer
+    if not answer.user or not answer.option_ids:
+        return
+
+    poll = _rating_polls_table().get_item(Key={'pollId': answer.poll_id}).get('Item')
+    if not poll:
+        logger.info(f"poll_answer for untracked poll {answer.poll_id} — ignoring")
+        return
+
+    rating = answer.option_ids[0]
+    if rating == 0:
+        logger.info(f"User {answer.user.id} chose 'view results', not a rating — skipping")
+        return
+    if rating < 1 or rating > 10:
+        logger.warning(f"Unexpected option_id {rating} for poll {answer.poll_id}")
+        return
+
+    _rating_votes_table().put_item(Item={
+        'pollId': answer.poll_id,
+        'telegramUserId': answer.user.id,
+        'username': answer.user.username,
+        'firstName': answer.user.first_name,
+        'lastName': answer.user.last_name,
+        'rating': rating,
+        'questionText': poll.get('questionText', ''),
+        'answeredAt': _now_iso(),
+    })
+    logger.info(f"Recorded rating {rating} from user {answer.user.id} for poll {answer.poll_id}")
+
+
 def update_handler(update: Update):
     """Process incoming update."""
-    if not update.message:
-        logger.warning("Update without message received")
+    if update.poll_answer:
+        handle_poll_answer(update)
         return
-    
+
+    if not update.message:
+        logger.warning("Update without message or poll_answer received")
+        return
+
     bot = Bot()
     command = update.message.get_command()
     
@@ -291,6 +419,8 @@ def update_handler(update: Update):
         handle_poll_command(bot, update)
     elif command == '/bool':
         handle_bool_command(bot, update)
+    elif command == '/stats':
+        handle_stats_command(bot, update)
     else:
         # Unknown command or regular message - ignore
         logger.info(f"Ignoring message: {update.message.text}")
