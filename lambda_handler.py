@@ -248,6 +248,85 @@ def notify_new_signup(event, context):
     return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
 
 
+def _feedback_message_text(feedback: dict) -> str:
+    """Format one ttrpg_club_telegram_feedback item into the DM sent to the GM."""
+    if feedback.get('revealIdentity'):
+        first = feedback.get('submitterFirstName', '') or ''
+        last = feedback.get('submitterLastName', '') or ''
+        username = feedback.get('submitterUsername', '')
+        who = f"{first} {last}".strip() or 'Учасник'
+        if username:
+            who += f" (@{username})"
+    else:
+        who = 'Анонімно'
+
+    lines = [
+        "📝 Новий фідбек про сесію",
+        f"Від: {who}",
+        "",
+        f"Пригода/історія: {feedback.get('adventureRating', '—')}/10",
+        f"Стіл: {feedback.get('tableRating', '—')}/10",
+        f"Майстер: {feedback.get('gmRating', '—')}/10",
+        f"Себе: {feedback.get('selfRating', '—')}/10",
+    ]
+
+    text = feedback.get('feedbackText', '')
+    if text:
+        lines += ["", text]
+
+    return "\n".join(lines)
+
+
+def notify_new_feedback(event, context):
+    """
+    Lambda handler triggered by the ttrpg_club_telegram_feedback DynamoDB Stream — DMs
+    the session's GM with each new feedback submission. The submitter's identity is
+    only included if they checked "reveal" in the Mini App form; otherwise the message
+    says "Анонімно". A Telegram bot can only DM a user who has previously started a
+    private chat with it — if the GM never has, sendMessage comes back with a non-2xx
+    status rather than raising, so that's logged as a warning and the batch continues
+    rather than failing outright.
+    """
+    bot = Bot()
+    records = event.get('Records', [])
+    logger.info(f"notify_new_feedback received {len(records)} stream record(s)")
+
+    for record in records:
+        if record.get('eventName') != 'INSERT':
+            continue
+
+        new_image = record.get('dynamodb', {}).get('NewImage')
+        if not new_image:
+            continue
+
+        feedback = _deserialize_dynamodb_item(new_image)
+        poll_id = feedback.get('pollId')
+        poll = _rating_polls_table().get_item(Key={'pollId': poll_id}).get('Item') if poll_id else None
+        if not poll:
+            logger.warning(f"Feedback for unknown poll {poll_id} — cannot find GM to notify")
+            continue
+
+        gm_user_id = poll.get('creatorUserId')
+        if not gm_user_id:
+            logger.warning(f"Poll {poll_id} has no recorded creatorUserId — cannot DM the GM")
+            continue
+
+        text = f"{poll.get('questionText', '')}\n\n{_feedback_message_text(feedback)}"
+        try:
+            status = bot.send_message(chat_id=int(gm_user_id), text=text)
+            if status >= 300:
+                logger.warning(
+                    f"Could not DM GM {gm_user_id} for poll {poll_id} (status {status}) — "
+                    "they may never have started a private chat with the bot"
+                )
+            else:
+                logger.info(f"DMed GM {gm_user_id} with feedback for poll {poll_id}")
+        except Exception as e:
+            logger.error(f"Failed to DM GM {gm_user_id} for poll {poll_id}: {e}")
+
+    return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
+
+
 def handle_start_command(bot: Bot, update: Update):
     """Handle /start command."""
     bot.send_message(
@@ -319,22 +398,58 @@ def handle_poll_command(bot: Bot, update: Update):
 
     # Remember what this poll_id was rating, so a later poll_answer webhook update
     # (which only carries poll_id + option_ids, not the question) can make sense of it.
+    # The creator is remembered too: they're the session's GM for stats ("My Games
+    # Conducted") and the one who gets DMed detailed feedback.
     poll = (response or {}).get('result', {}).get('poll', {})
     poll_id = poll.get('id')
     if poll_id:
+        creator = update.message.from_user
         item = {
             'pollId': poll_id,
             'questionText': poll_question,
             'chatId': update.message.chat.id,
             'createdAt': _now_iso(),
+            'creatorUserId': creator.id,
+            'creatorFirstName': creator.first_name,
+            'creatorLastName': creator.last_name,
+            'creatorUsername': creator.username,
         }
         if update.message.message_thread_id is not None:
             item['messageThreadId'] = update.message.message_thread_id
         _rating_polls_table().put_item(Item=item)
+
+        _send_feedback_link(bot, update, poll_id)
     else:
         logger.warning(f"sendPoll response had no poll id: {response}")
 
     logger.info(f"Poll created by {update.message.from_user.username}: {poll_question}")
+
+
+def _send_feedback_link(bot: Bot, update: Update, poll_id: str):
+    """
+    Alongside the quick 1-10 poll, send a button opening the Mini App straight to this
+    session's detailed feedback form (four 1-10 questions + optional free text). This is
+    a separate, private channel from the poll's own rating/player-list bookkeeping — see
+    README_LAMBDA.md. Uses `startapp=feedback_<pollId>` so the Mini App knows which
+    session to render the form for. Degrades silently if the Mini App isn't registered
+    yet, same as /stats.
+    """
+    base_deep_link = os.environ.get('MINI_APP_DEEP_LINK')
+    if not base_deep_link:
+        logger.warning("MINI_APP_DEEP_LINK is not configured — skipping feedback link")
+        return
+
+    feedback_link = f"{base_deep_link}?startapp=feedback_{poll_id}"
+    bot.send_message(
+        update.message.chat.id,
+        'Залиште розгорнутий фідбек про цю сесію:',
+        message_thread_id=update.message.message_thread_id,
+        reply_markup={
+            'inline_keyboard': [[
+                {'text': '📝 Залишити фідбек', 'url': feedback_link}
+            ]]
+        }
+    )
 
 
 def handle_bool_command(bot: Bot, update: Update):
@@ -365,11 +480,15 @@ def handle_bool_command(bot: Bot, update: Update):
 def handle_poll_answer(update: Update):
     """
     Record a vote on a /rate poll (option_ids[0] == 0 is "Подивитись відповідь" —
-    not a real rating, so it's not stored). Silently ignored for polls we didn't
-    create via /rate (e.g. /bool polls) since they're never in the polls table.
+    not a real rating, so it's not stored). A retracted vote (Telegram sends an empty
+    option_ids when a user deselects their answer on a single-choice poll) or a switch
+    to "view results" clears any previously stored rating for that user — otherwise
+    someone who voted an 8, then realized they hadn't actually played and retracted,
+    would stay counted as a player forever. Silently ignored for polls we didn't create
+    via /rate (e.g. /bool polls) since they're never in the polls table.
     """
     answer = update.poll_answer
-    if not answer.user or not answer.option_ids:
+    if not answer.user:
         return
 
     poll = _rating_polls_table().get_item(Key={'pollId': answer.poll_id}).get('Item')
@@ -377,9 +496,19 @@ def handle_poll_answer(update: Update):
         logger.info(f"poll_answer for untracked poll {answer.poll_id} — ignoring")
         return
 
+    def clear_vote(reason: str):
+        _rating_votes_table().delete_item(
+            Key={'pollId': answer.poll_id, 'telegramUserId': answer.user.id}
+        )
+        logger.info(f"Cleared any stored rating for user {answer.user.id} on poll {answer.poll_id} ({reason})")
+
+    if not answer.option_ids:
+        clear_vote("retracted vote")
+        return
+
     rating = answer.option_ids[0]
     if rating == 0:
-        logger.info(f"User {answer.user.id} chose 'view results', not a rating — skipping")
+        clear_vote("switched to 'view results'")
         return
     if rating < 1 or rating > 10:
         logger.warning(f"Unexpected option_id {rating} for poll {answer.poll_id}")

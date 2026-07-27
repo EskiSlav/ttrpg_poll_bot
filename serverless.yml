@@ -33,6 +33,7 @@ provider:
             - dynamodb:ListStreams
           Resource:
             - ${self:custom.signupRequestsStreamArn}
+            - ${self:custom.feedbackStreamArn}
         # These two tables are Terraform-managed (aws_infra), with a fully deterministic
         # ARN (fixed account/region/table name) — no need to pass them in via --param.
         - Effect: Allow
@@ -52,11 +53,12 @@ custom:
   # Your own numeric Telegram chat ID (or a group's) — where new club signup requests get posted.
   # Not a secret, so a plain value here (or `--param` at deploy time) is fine.
   adminChatId: ${param:adminChatId}
-  # Stream ARN of the ttrpg_club_signup_requests DynamoDB table (from the ttrpg_website
-  # repo's aws_infra Terraform). Get it with:
-  #   terraform output -raw dynamodb_table_stream_arn
-  # (run from aws_infra/dynamodb/ttrpg_club_signup_requests)
-  signupRequestsStreamArn: ${param:signupRequestsStreamArn}
+  # Stream ARNs aren't deterministic (they carry a timestamp assigned when the stream is
+  # enabled, unlike a table ARN), so these can't be hardcoded — but aws_infra's Terraform
+  # publishes each as an SSM parameter of the same name at apply time, so reading them
+  # here needs no manual --param and stays correct even if a table is ever recreated.
+  signupRequestsStreamArn: ${ssm:/ttrpg_club/signup_requests_stream_arn}
+  feedbackStreamArn: ${ssm:/ttrpg_club/telegram_feedback_stream_arn}
   # Fixed table names from aws_infra's Terraform (dynamodb/ttrpg_club_telegram_rating_*).
   ratingPollsTableName: ttrpg_club_telegram_rating_polls
   ratingVotesTableName: ttrpg_club_telegram_rating_votes
@@ -93,6 +95,15 @@ functions:
       - stream:
           type: dynamodb
           arn: ${self:custom.signupRequestsStreamArn}
+          startingPosition: LATEST
+          batchSize: 10
+
+  notifyFeedback:
+    handler: lambda_handler.notify_new_feedback
+    events:
+      - stream:
+          type: dynamodb
+          arn: ${self:custom.feedbackStreamArn}
           startingPosition: LATEST
           batchSize: 10
 

@@ -66,10 +66,10 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
 
 ## Usage
 
-- `/poll <text>` - Create a rating poll (1-10)
-- `/rate <text>` - Create a rating poll (1-10)
+- `/poll <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
+- `/rate <text>` - Create a rating poll (1-10); also sends a "Leave Feedback" Mini App link
 - `/bool <question>` - Create a Yes/No poll
-- `/stats` - Open the club's Telegram Mini App to see your own rating stats
+- `/stats` - Open the club's Telegram Mini App to see your own rating stats and game history
 - `/start` - Show help
 
 ## Configuration
@@ -115,32 +115,40 @@ DynamoDB Stream from the separate `ttrpg_website`/`aws_infra` project — it pos
 to `ADMIN_CHAT_ID` whenever someone submits a new club membership request. It reuses this
 bot's existing token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
 
-Deploy it (in addition to the token in SSM) by passing two extra params:
+Deploy it (in addition to the token in SSM) by passing your admin chat ID:
 
 ```bash
 # Your own numeric Telegram chat ID — see README.md's normal getUpdates instructions,
 # or message the bot and check the chat.id there.
 ADMIN_CHAT_ID=123456789
 
-# From the aws_infra repo: cd dynamodb/ttrpg_club_signup_requests && terraform output -raw dynamodb_table_stream_arn
-STREAM_ARN=arn:aws:dynamodb:eu-west-2:...:table/ttrpg_club_signup_requests/stream/...
-
 serverless deploy --stage prod --region eu-west-2 \
-  --param="adminChatId=$ADMIN_CHAT_ID" \
-  --param="signupRequestsStreamArn=$STREAM_ARN"
+  --param="adminChatId=$ADMIN_CHAT_ID"
 ```
 
-If the club's `ttrpg_club_signup_requests` table is ever recreated, its stream ARN changes
-and you'll need to redeploy with the new value.
+The table's stream ARN itself needs no `--param` — `aws_infra`'s Terraform for
+`ttrpg_club_signup_requests` publishes it to the SSM parameter
+`/ttrpg_club/signup_requests_stream_arn`, which `serverless.yml` reads directly via
+`${ssm:...}`. That stays correct automatically even if the table is ever destroyed and
+recreated (a fresh `terraform apply` there updates the SSM value too) — just make sure
+that table's Terraform has been applied at least once before deploying this bot.
 
 ## Personal Stats Mini App (`/stats`)
 
 Every `/rate` poll is non-anonymous, so Telegram sends this bot a `poll_answer` webhook
 update whenever someone votes — the `webhook` function now records these (who rated
 what, when) into two new DynamoDB tables managed by the `ttrpg_website2`/`aws_infra`
-Terraform: `ttrpg_club_telegram_rating_polls` (which poll_id was rating which text) and
-`ttrpg_club_telegram_rating_votes` (the actual votes). The "Подивитись відповідь" /
-view-results option (index 0) is never stored as a rating.
+Terraform: `ttrpg_club_telegram_rating_polls` (which poll_id was rating which text, plus
+who created it — see below) and `ttrpg_club_telegram_rating_votes` (the actual votes).
+The "Подивитись відповідь" / view-results option (index 0) is never stored as a rating —
+and neither is a **retracted** vote: if someone taps their selection again to deselect it,
+or switches to "view results" after having voted, Telegram sends a `poll_answer` with
+that new state, and the bot deletes any previously stored rating for them. This matters
+because it's how "My Games Played" (below) decides who actually played a session.
+
+Each poll's item also remembers who ran it (`creatorUserId` etc., captured from the
+`/rate` command's sender) — that's the session's GM for stats purposes, and who gets
+DMed detailed feedback (see the next section).
 
 The `ttrpg_website2` frontend has a standalone Mini App page (`/telegram`) that reads
 Telegram's signed `initData` (proof of identity — no separate login) and calls a new
@@ -170,6 +178,45 @@ deep link, which works everywhere):
 
 Until `miniAppDeepLink` is set, `/stats` replies with a "temporarily unavailable"
 message instead of a broken button.
+
+The Mini App also has three navigation buttons under `/stats` — **My Games Played**,
+**My Games Conducted**, **All Games** — each date-range filterable and drilling down
+into a per-session voter breakdown. These read from the same two tables above (plus a
+`creatorUserId-index` GSI on the polls table for "conducted") via new `POST
+/telegram/games/*` endpoints on the club API — no bot changes needed for this part.
+
+## Session Feedback (`?startapp=feedback_<pollId>`)
+
+Alongside the quick 1-10 poll, every `/rate` also sends a second message with a
+**"📝 Залишити фідбек"** button — a `t.me/<bot>/<app>?startapp=feedback_<pollId>` deep
+link that opens the Mini App straight to that session's detailed feedback form (four
+1-10 questions — adventure/story, table, GM, self — plus optional free text). This is
+deliberately separate from the quick poll vote: it's a private, mostly-anonymous channel
+for the GM, not part of the public rating/player-list bookkeeping above.
+
+Feedback submissions are stored in a third new table, `ttrpg_club_telegram_feedback`
+(also in `aws_infra`'s Terraform). Delivery to the GM works the same way as
+`notifySignup`: a DynamoDB Stream on that table triggers this repo's `notifyFeedback`
+function (`lambda_handler.notify_new_feedback`), which DMs the GM (looked up via the
+poll's `creatorUserId`) with the feedback content — revealing the submitter's identity
+only if they checked "reveal" in the form, otherwise the DM just says "Анонімно".
+
+**Note**: a Telegram bot can only DM a user who has already started a private chat with
+it at least once — if the GM never has, the DM silently fails (logged as a warning, not
+an error) rather than crashing. If GMs report not receiving feedback, the fix is usually
+just having them send `/start` to the bot in a private chat once.
+
+Like the signup notifications above, this table's stream ARN needs no `--param` —
+`aws_infra`'s Terraform for `ttrpg_club_telegram_feedback` publishes it to the SSM
+parameter `/ttrpg_club/telegram_feedback_stream_arn`, which `serverless.yml` reads
+directly. Just make sure that table's Terraform has been applied at least once first,
+then deploy as usual:
+
+```bash
+serverless deploy --stage prod --region eu-west-2 \
+  --param="adminChatId=$ADMIN_CHAT_ID" \
+  --param="miniAppDeepLink=https://t.me/your_bot/stats"
+```
 
 ## Cost
 
