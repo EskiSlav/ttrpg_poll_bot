@@ -6,47 +6,62 @@ Telegram bot that creates rating polls, deployed on AWS Lambda.
 
 - **AWS Lambda**: Runs the bot code (3 functions: `webhook`, `notifySignup`, `notifyFeedback`)
 - **API Gateway (HTTP API v2)**: Receives the webhook from Telegram
-- **SSM Parameter Store**: Stores the bot token securely
-- **Terraform** (`aws_infra/lambda/ttrpg_poll_bot`): Owns all of the above — the
-  functions, the API, the shared IAM role, and the two DynamoDB Stream event source
-  mappings. This repo only ever ships *code*, via `build.sh` + `aws lambda
-  update-function-code` (by hand or via GitHub Actions) — no CloudFormation, no
-  Serverless Framework. Matches exactly how `ttrpg_website2`'s backend deploys.
+- **SSM Parameter Store**: Stores the bot token + admin chat ID securely
+- **Terraform** — two fully independent, symmetric stacks, one per environment:
+  `aws_infra/lambda/ttrpg_poll_bot_dev` and `aws_infra/lambda/ttrpg_poll_bot_prod`. Each
+  owns its own functions, its own API Gateway (own webhook URL, own registered Telegram
+  bot), its own IAM role, its own DynamoDB Stream event source mappings (reading that
+  same environment's `dynamodb/ttrpg_club/<env>` tables), and its own Terraform-managed
+  SSM placeholders for the bot token and admin chat ID. This repo only ever ships
+  *code*, via `build.sh` + `aws lambda update-function-code` (by hand or via GitHub
+  Actions — same code both places, but each push only updates the one stack matching
+  the branch: `develop` → dev's 3 functions, `main` → prod's 3 functions) — no
+  CloudFormation, no Serverless Framework. Matches exactly how `ttrpg_website2`'s
+  backend deploys (branch → environment promotion).
+
+  (These two modules used to be one combined `lambda/ttrpg_poll_bot` module — see that
+  directory's `migrate-to-split-modules.sh` if you're looking at history; the live prod
+  bot's function names/API Gateway never changed across that split, so its Telegram
+  webhook was never disrupted.)
 
 ## Prerequisites
 
 1. Python 3.14 + pip
 2. AWS CLI configured with credentials
-3. Telegram bot token from [@BotFather](https://t.me/botfather)
+3. Telegram bot token from [@BotFather](https://t.me/botfather) — a separate bot per environment
 4. Terraform (only needed when the *infrastructure* changes — not for routine code pushes)
 
 ## Setup
 
-### 1. Store Bot Token in SSM
+Pick an environment directory: `aws_infra/lambda/ttrpg_poll_bot_dev` or
+`.../ttrpg_poll_bot_prod`. The two are independent — repeat this whole section for each.
 
-```bash
-aws ssm put-parameter \
-  --name "/telegram/poll_bot/token" \
-  --value "YOUR_BOT_TOKEN" \
-  --type "SecureString" \
-  --region eu-west-2
-```
-
-### 2. Apply the Terraform
-
-From `aws_infra/lambda/ttrpg_poll_bot`:
+### 1. Apply the Terraform
 
 ```bash
 cd ../../../ttrpg_poll_bot && ./build.sh   # produces build/, which Terraform's source_path reads
-cd -
+cd -   # back in aws_infra/lambda/ttrpg_poll_bot_<env>
 terraform init
 terraform apply -var="admin_chat_id=<your numeric chat id>"
 ```
 
-(If you're migrating from an existing Serverless Framework deployment rather than
-starting fresh, see `import-from-serverless.sh` in that same directory — it imports the
-already-running Lambda/API Gateway/IAM role/event source mappings into this Terraform
-module with zero downtime, instead of recreating them.)
+This also creates two Terraform-managed SSM placeholders (`/ttrpg_club/<env>/poll_bot/token`
+and `/ttrpg_club/<env>/telegram_admin_chat_id`, value `"replace_me!"` until you set them
+— Terraform ignores further changes to their value, so it won't clobber the real one).
+
+(`ttrpg_poll_bot_prod/import-from-serverless.sh` is only relevant if you're migrating an
+existing Serverless Framework deployment from scratch rather than starting fresh.)
+
+### 2. Store the Real Bot Token in SSM
+
+```bash
+aws ssm put-parameter \
+  --name "/ttrpg_club/<env>/poll_bot/token" \
+  --value "YOUR_BOT_TOKEN" \
+  --type "SecureString" \
+  --overwrite \
+  --region eu-west-2
+```
 
 `terraform output webhook_url` gives you the API Gateway URL.
 
@@ -66,19 +81,16 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
 ### Routine code changes
 
 Once the infrastructure above exists, day-to-day changes to `lambda_handler.py` don't
-need Terraform at all — either push to `main` (see GitHub Actions Deployment below) or,
-locally:
+need Terraform at all — either push to `develop` (updates the 3 dev functions) or
+`main` (updates the 3 prod functions) — see GitHub Actions Deployment below — or,
+locally, for whichever stack you're updating:
 
 ```bash
 ./build.sh
 cd build && zip -r ../function.zip . -x "__pycache__/*" && cd ..
-aws lambda update-function-code --function-name telegram-poll-bot-prod-webhook --zip-file fileb://function.zip
-aws lambda update-function-code --function-name telegram-poll-bot-prod-notifySignup --zip-file fileb://function.zip
-aws lambda update-function-code --function-name telegram-poll-bot-prod-notifyFeedback --zip-file fileb://function.zip
-# ...and the dev stage, if you've applied it (see "Dev Stage" below):
-aws lambda update-function-code --function-name telegram-poll-bot-dev-webhook --zip-file fileb://function.zip
-aws lambda update-function-code --function-name telegram-poll-bot-dev-notifySignup --zip-file fileb://function.zip
-aws lambda update-function-code --function-name telegram-poll-bot-dev-notifyFeedback --zip-file fileb://function.zip
+aws lambda update-function-code --function-name telegram-poll-bot-<env>-webhook --zip-file fileb://function.zip
+aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifySignup --zip-file fileb://function.zip
+aws lambda update-function-code --function-name telegram-poll-bot-<env>-notifyFeedback --zip-file fileb://function.zip
 ```
 
 ## Usage
@@ -91,7 +103,7 @@ aws lambda update-function-code --function-name telegram-poll-bot-dev-notifyFeed
 
 ## Configuration
 
-Edit `aws_infra/lambda/ttrpg_poll_bot/variables.tf` (region, `admin_chat_id`,
+Edit `aws_infra/lambda/ttrpg_poll_bot_<env>/variables.tf` (region, `admin_chat_id`,
 `mini_app_deep_link`) or `main.tf` (memory, timeout, environment variables) — these now
 live in Terraform, not `serverless.yml` (removed as part of the Terraform migration).
 
@@ -113,48 +125,30 @@ aws logs tail /aws/lambda/telegram-poll-bot-prod-webhook --follow
 ## Cleanup
 
 ```bash
-cd aws_infra/lambda/ttrpg_poll_bot && terraform destroy
+cd aws_infra/lambda/ttrpg_poll_bot_<env> && terraform destroy
 ```
 
-Don't forget to delete the SSM parameter:
+Don't forget to delete that environment's SSM parameters:
 ```bash
-aws ssm delete-parameter --name "/telegram/poll_bot/token"
+aws ssm delete-parameter --name "/ttrpg_club/<env>/poll_bot/token"
+aws ssm delete-parameter --name "/ttrpg_club/<env>/telegram_admin_chat_id"
 ```
 
-## Dev Stage (isolated test bot)
+## Dev vs Prod (two independent bots)
 
-Alongside the real (`-prod-`) functions, the Terraform also creates a fully isolated
-`-dev-` copy of all 3 functions — same code, own IAM role, own Telegram bot token, and
-the (currently empty) `dynamodb/ttrpg_club/prod` tables instead of the real
-`dynamodb/ttrpg_club/dev` ones the live bot uses. **A dev/test bot can never read or
-write real club data.** It's reached at a different path on the *same* API Gateway
-(`/dev/webhook` instead of `/webhook`) rather than a separate API — HTTP API v2's
-Lambda-proxy integrations are fixed per route, not swappable per stage, so a distinct
-route is what actually gets you a second, independently-routable webhook URL on one
-host.
+Dev and prod are two completely separate Telegram bots, each with its own registered
+webhook, own IAM role, and own DynamoDB tables (`ttrpg_club_dev_*` / `ttrpg_club_prod_*`)
+— nothing is shared, so testing in dev can never touch real prod data or vice versa.
+Set each one up via the Setup section above, once per environment. For the dev bot's
+Mini App (stats/feedback pages), apply `aws_infra/s3_cloudfront/ttrpg_club_frontend_dev`
+(the website's dev frontend — see that repo's README), register a Mini App with
+@BotFather pointing at its CloudFront domain, and set
+`-var="mini_app_deep_link=https://t.me/<dev_bot>/<app>"` when applying
+`lambda/ttrpg_poll_bot_dev`.
 
-Setup, one time:
-
-1. Create a second bot via [@BotFather](https://t.me/botfather) (`/newbot`) and store its
-   token under a different SSM parameter name:
-   ```bash
-   aws ssm put-parameter --name "/telegram/poll_bot_dev/token" --value "YOUR_DEV_BOT_TOKEN" --type "SecureString" --region eu-west-2
-   ```
-2. `terraform apply` (optionally passing `-var="dev_admin_chat_id=..."` if you want dev
-   signup notifications to go to a different chat than prod's `admin_chat_id`).
-3. `terraform output webhook_dev_url` → register it as the dev bot's webhook:
-   ```bash
-   curl -X POST "https://api.telegram.org/bot<DEV_BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"<webhook_dev_url>"}'
-   ```
-4. For the dev Mini App (stats/feedback pages), apply
-   `aws_infra/s3_cloudfront/ttrpg_club_frontend_dev` (a separate S3 bucket + CloudFront
-   distribution, so a dev frontend build never overwrites the real site), build/sync the
-   frontend to it, register a second Mini App with @BotFather pointing at that dev
-   CloudFront domain, and set `-var="mini_app_deep_link_dev=https://t.me/<dev_bot>/<app>"`.
-
-Routine code pushes update both stages together (see the GitHub Actions section above,
-and the manual command list right below "Routine code changes") — since the code is
-identical, there's no separate dev build/deploy step.
+Routine code pushes update both bots' functions together in one CI run (see the GitHub
+Actions section below, and the manual command list under "Routine code changes" above)
+— since the code is identical, there's no separate per-environment build/deploy step.
 
 ## Club Signup Notifications (`notifySignup`)
 
@@ -163,19 +157,20 @@ DynamoDB Stream from the separate `ttrpg_website2`/`aws_infra` project — it po
 to `ADMIN_CHAT_ID` whenever someone submits a new club membership request. It reuses this
 bot's existing token (same SSM parameter, `Bot.send_message`), so no second bot is needed.
 
-The stream ARN needs no manual wiring — `aws_infra`'s Terraform for
-`ttrpg_club_signup_requests` publishes it to the SSM parameter
-`/ttrpg_club/signup_requests_stream_arn`, which `lambda/ttrpg_poll_bot`'s Terraform reads
-directly via a `data "aws_ssm_parameter"` block. Just make sure that table's Terraform
-has been applied at least once before applying this one.
+The stream ARN needs no manual wiring — `aws_infra`'s Terraform for that environment's
+`signup_requests` table publishes it to SSM as `/ttrpg_club/<env>/signup_requests_stream_arn`,
+which `lambda/ttrpg_poll_bot_<env>`'s Terraform reads directly via a
+`data "aws_ssm_parameter"` block. Just make sure that table's Terraform has been applied
+at least once before applying this one.
 
 ## Personal Stats Mini App (`/stats`)
 
 Every `/rate` poll is non-anonymous, so Telegram sends this bot a `poll_answer` webhook
 update whenever someone votes — the `webhook` function now records these (who rated
 what, when) into two new DynamoDB tables managed by the `ttrpg_website2`/`aws_infra`
-Terraform: `ttrpg_club_telegram_rating_polls` (which poll_id was rating which text, plus
-who created it — see below) and `ttrpg_club_telegram_rating_votes` (the actual votes).
+Terraform: `ttrpg_club_<env>_telegram_rating_polls` (which poll_id was rating which
+text, plus who created it — see below) and `ttrpg_club_<env>_telegram_rating_votes`
+(the actual votes).
 The "Подивитись відповідь" / view-results option (index 0) is never stored as a rating —
 and neither is a **retracted** vote: if someone taps their selection again to deselect it,
 or switches to "view results" after having voted, Telegram sends a `poll_answer` with
@@ -191,7 +186,9 @@ Telegram's signed `initData` (proof of identity — no separate login) and calls
 `POST /telegram/stats` endpoint on the club's own API to show a user their own rating
 history. That endpoint needs `ssm:GetParameter` on this bot's token (to verify
 `initData`'s signature) and read access to the votes table — both already wired into
-`aws_infra`'s `lambda/ttrpg_club_api` Terraform.
+`aws_infra`'s `lambda/ttrpg_club_api_<env>` Terraform (each environment's website
+backend reads the bot token from that same environment's
+`/ttrpg_club/<env>/poll_bot/token`).
 
 **People who voted don't need to be registered on the club website at all** — stats are
 keyed purely by Telegram user ID, independent of the website's own member accounts.
@@ -242,22 +239,26 @@ an error) rather than crashing. If GMs report not receiving feedback, the fix is
 just having them send `/start` to the bot in a private chat once.
 
 Like the signup notifications above, this table's stream ARN needs no manual wiring —
-`aws_infra`'s Terraform for `ttrpg_club_telegram_feedback` publishes it to the SSM
-parameter `/ttrpg_club/telegram_feedback_stream_arn`, which `lambda/ttrpg_poll_bot`'s
-Terraform reads directly. Just make sure that table's Terraform has been applied at
-least once first.
+`aws_infra`'s Terraform for that environment's `telegram_feedback` table publishes it to
+SSM as `/ttrpg_club/<env>/telegram_feedback_stream_arn`, which
+`lambda/ttrpg_poll_bot_<env>`'s Terraform reads directly. Just make sure that table's
+Terraform has been applied at least once first.
 
 ## GitHub Actions Deployment
 
-Pushing to `main` deploys automatically via `.github/workflows/deploy.yml` (or trigger it
-by hand from the Actions tab — it also has `workflow_dispatch`): build the Python
-package, zip it, and `aws lambda update-function-code` on all 3 functions — the same
-OIDC pattern and the same "just push code" shape `ttrpg_website2`'s backend pipeline
-uses (no CloudFormation/Serverless involved, so no `SERVERLESS_ACCESS_KEY` or similar is
-needed here). One-time setup:
+Pushing to `develop` or `main` deploys automatically via `.github/workflows/deploy.yml`
+(or trigger it by hand from the Actions tab — it also has `workflow_dispatch`, which
+uses whichever branch you run it from): build the Python package, zip it, and
+`aws lambda update-function-code` on **only that branch's 3 functions** —
+`develop` → `telegram-poll-bot-dev-*`, `main` → `telegram-poll-bot-prod-*` (the
+workflow picks the name prefix from `github.ref_name`). Same OIDC pattern and the same
+"just push code" shape `ttrpg_website2`'s backend pipeline uses (no
+CloudFormation/Serverless involved, so no `SERVERLESS_ACCESS_KEY` or similar is needed
+here). One-time setup:
 
-1. **Apply the infrastructure first** — `aws_infra/lambda/ttrpg_poll_bot` (see Setup
-   above) — CI only ever updates code on functions that already exist.
+1. **Apply the infrastructure first** — both `aws_infra/lambda/ttrpg_poll_bot_dev` and
+   `.../ttrpg_poll_bot_prod` (see Setup above) — CI only ever updates code on functions
+   that already exist.
 2. **Apply the deploy role's Terraform** — `aws_infra/iam/github_actions_ttrpg_poll_bot`.
    A role dedicated to this repo (reuses the OIDC provider `ttrpg_website2`'s pipeline
    already created, but doesn't share its role). `terraform output deploy_role_arn`
@@ -269,9 +270,11 @@ needed here). One-time setup:
    `AWS_DEPLOY_ROLE_ARN` to the ARN from step 2.
 
 This role is intentionally narrow — just `lambda:UpdateFunctionCode` +
-`GetFunctionConfiguration` on this project's 3 functions, matching the website's own CI
-role. All the broader stack-management permissions a CloudFormation-driven deploy would
-have needed are gone now that Terraform owns the infrastructure directly.
+`GetFunctionConfiguration`, scoped by a `telegram-poll-bot-*` name pattern that covers
+both stacks' 6 functions (the workflow itself is what limits each run to just the 3
+matching the pushed branch). All the broader stack-management permissions a
+CloudFormation-driven deploy would have needed are gone now that Terraform owns the
+infrastructure directly.
 
 ## Cost
 

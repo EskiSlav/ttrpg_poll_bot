@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   workflow_dispatch: {}
 
 permissions:
@@ -37,10 +37,15 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update Lambda function code
+        env:
+          # develop -> the dev stack's 3 functions, main -> the prod stack's 3 functions.
+          # Only ever touches the one stack matching the branch pushed.
+          STAGE: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
         run: |
           for fn in \
-            telegram-poll-bot-prod-webhook telegram-poll-bot-prod-notifySignup telegram-poll-bot-prod-notifyFeedback \
-            telegram-poll-bot-dev-webhook telegram-poll-bot-dev-notifySignup telegram-poll-bot-dev-notifyFeedback; do
+            "telegram-poll-bot-${STAGE}-webhook" \
+            "telegram-poll-bot-${STAGE}-notifySignup" \
+            "telegram-poll-bot-${STAGE}-notifyFeedback"; do
             aws lambda update-function-code --function-name "$fn" --zip-file fileb://function.zip
             aws lambda wait function-updated --function-name "$fn"
           done
