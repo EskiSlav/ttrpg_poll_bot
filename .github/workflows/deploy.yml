@@ -1,0 +1,46 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # required for AWS OIDC
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Build deployment package
+        run: ./build.sh
+
+      - name: Zip Lambda package
+        run: |
+          cd build
+          zip -r ../function.zip . -x "__pycache__/*"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update Lambda function code
+        run: |
+          for fn in \
+            telegram-poll-bot-prod-webhook telegram-poll-bot-prod-notifySignup telegram-poll-bot-prod-notifyFeedback \
+            telegram-poll-bot-dev-webhook telegram-poll-bot-dev-notifySignup telegram-poll-bot-dev-notifyFeedback; do
+            aws lambda update-function-code --function-name "$fn" --zip-file fileb://function.zip
+            aws lambda wait function-updated --function-name "$fn"
+          done

@@ -75,7 +75,12 @@ class Message:
     def get_command(self) -> str:
         """Extract command from message if present."""
         if self.entities and self.entities[0].get('type') == 'bot_command':
-            return self.text.split()[0].rstrip('@ttrpgpollbot')
+            command = self.text.split()[0]
+            for suffix in ('@ttrpgpollbot', '@ttrpgpolltestbot'):
+                if command.endswith(suffix):
+                    command = command[: -len(suffix)]
+                    break
+            return command
         return ''
 
     def get_command_args(self) -> str:
