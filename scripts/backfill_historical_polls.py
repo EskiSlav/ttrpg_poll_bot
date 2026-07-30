@@ -50,23 +50,37 @@ import re
 import sys
 from datetime import datetime, timezone
 
-# Must match lambda_handler.py's RATING_OPTIONS exactly — this is how a poll message is
-# recognized as one of ours (vs. e.g. a /bool poll) and how option index -> rating maps.
-RATING_OPTIONS = [
-    "Подивитись відповідь",
-    "1 / 10 🤬",
-    "2 / 10 😡",
-    "3 / 10 🥴",
-    "4 / 10 😞",
-    "5 / 10 🤔",
-    "6 / 10 🙂",
-    "7 / 10 😀",
-    "8 / 10 ☺️",
-    "9 / 10 😍",
-    "10 / 10 🤩",
-]
-
 COMMAND_RE = re.compile(r"^/(rate|poll)(?:@\w+)?(?:\s+(.*))?$", re.DOTALL)
+
+# lambda_handler.py's RATING_OPTIONS emoji have drifted at least once over the bot's
+# history (confirmed: current "9/10"/"10/10" emoji don't match an earlier version) —
+# an exact copy of today's list would silently reject every poll created under an older
+# version. Match structurally on the "N / 10" numeric prefix instead, which is the one
+# thing that's stayed constant since /rate's first version.
+RATING_LABEL_RE = re.compile(r"^(\d{1,2})\s*/\s*10\b")
+
+
+def _rating_poll_shape(answers) -> dict | None:
+    """
+    {option_bytes: rating (1-10)} for a poll that looks like one /rate created, or None
+    if it doesn't (e.g. a /bool yes/no poll, or anything with a different shape).
+    Requires exactly 11 options and exactly one match per rating 1-10 — anything looser
+    risks matching an unrelated poll that just happens to contain "N / 10" somewhere.
+    """
+    if len(answers) != 11:
+        return None
+    mapping: dict = {}
+    seen = set()
+    for a in answers:
+        m = RATING_LABEL_RE.match(a.text.text)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if not (1 <= n <= 10) or n in seen:
+            return None
+        seen.add(n)
+        mapping[a.option] = n
+    return mapping if len(seen) == 10 else None
 
 
 def _expected_question(args: str) -> str:
@@ -133,6 +147,17 @@ def _resolve_chat(client, chat_arg: str):
     for dialog in client.iter_dialogs():
         print(f"  {dialog.id:>16}  {dialog.name}", file=sys.stderr)
     sys.exit(f"Pick the exact id shown above for your club chat and pass it as --chat.")
+
+
+def cmd_list_chats(args):
+    """List every chat this account is in, with a real message count, to help pick the
+    right --chat for the other commands — a wrong chat (e.g. a small test group) scans
+    fine but silently finds zero polls, which looks identical to a real bug."""
+    client = _get_client(args.session)
+    for dialog in client.iter_dialogs():
+        kind = "channel" if dialog.is_channel else "group" if dialog.is_group else "user"
+        count = client.get_messages(dialog.entity, limit=0).total
+        print(f"{dialog.id:>16}  [{kind:7}]  {count:>6} messages  {dialog.name}")
 
 
 def cmd_check(args):
@@ -215,9 +240,8 @@ def cmd_scan(args):
         # not plain strings, in current Telethon/TL — unwrap .text once up front.
         question = poll.question.text
         answers = poll.answers
-        if len(answers) != len(RATING_OPTIONS) or any(
-            a.text.text != opt for a, opt in zip(answers, RATING_OPTIONS)
-        ):
+        option_rating_by_bytes = _rating_poll_shape(answers)
+        if option_rating_by_bytes is None:
             continue  # not one of our rating polls (e.g. a /bool yes-no poll)
 
         # Best preceding /rate or /poll command whose computed question text matches
@@ -252,8 +276,6 @@ def cmd_scan(args):
         if creator is None:
             unmatched_creator.append({"pollId": poll_row["pollId"], "question": question, "date": poll_row["createdAt"]})
 
-        option_index_by_bytes = {a.option: i for i, a in enumerate(answers)}
-
         offset = ""
         poll_blocked = False
         while True:
@@ -276,9 +298,9 @@ def cmd_scan(args):
                     continue  # MessagePeerVoteInputOption etc. — not a cast vote
                 if not isinstance(v.peer, PeerUser):
                     continue  # anonymous/channel vote — shouldn't happen in a group poll
-                idx = option_index_by_bytes.get(v.option)
-                if idx is None or idx == 0:
-                    continue  # unrecognized option, or "Подивитись відповідь" — not a rating
+                rating = option_rating_by_bytes.get(v.option)
+                if rating is None:
+                    continue  # "view results" or an unrecognized option — not a rating
                 user_id = v.peer.user_id
                 u = users_by_id.get(user_id)
                 votes.append({
@@ -287,7 +309,7 @@ def cmd_scan(args):
                     "username": getattr(u, "username", None),
                     "firstName": getattr(u, "first_name", None),
                     "lastName": getattr(u, "last_name", None),
-                    "rating": idx,
+                    "rating": rating,
                     "questionText": question,
                     "answeredAt": v.date.isoformat() if v.date else poll_row["createdAt"],
                 })
@@ -339,8 +361,37 @@ def cmd_load(args):
     polls_table = dynamodb.Table(args.polls_table)
     votes_table = dynamodb.Table(args.votes_table)
 
-    polls_to_write, polls_skipped = [], 0
+    # DynamoDB's BatchWriteItem rejects a batch containing two items with the same key
+    # ("Provided list of item keys contains duplicates") — dedupe defensively before
+    # writing rather than assume the export is clean. For polls (same message, so any
+    # duplicate should be identical) keep the first. For votes, keep whichever has the
+    # latest answeredAt — same "last write wins" semantics as the live poll_answer
+    # handler's put_item, in case a person's vote legitimately changed between the
+    # (possibly paginated) snapshots this was scanned from.
+    seen_polls: dict = {}
+    poll_dupes = 0
     for p in data["polls"]:
+        if p["pollId"] in seen_polls:
+            poll_dupes += 1
+            continue
+        seen_polls[p["pollId"]] = p
+
+    seen_votes: dict = {}
+    vote_dupes = 0
+    for v in data["votes"]:
+        key = (v["pollId"], v["telegramUserId"])
+        prev = seen_votes.get(key)
+        if prev is not None:
+            vote_dupes += 1
+            if v.get("answeredAt", "") <= prev.get("answeredAt", ""):
+                continue  # prev is same-or-newer, keep it
+        seen_votes[key] = v
+
+    if poll_dupes or vote_dupes:
+        print(f"Deduped {poll_dupes} duplicate poll row(s), {vote_dupes} duplicate vote row(s) from the export.")
+
+    polls_to_write, polls_skipped = [], 0
+    for p in seen_polls.values():
         existing = polls_table.get_item(Key={"pollId": p["pollId"]}).get("Item")
         if existing:
             polls_skipped += 1
@@ -349,7 +400,7 @@ def cmd_load(args):
         polls_to_write.append(item)
 
     votes_to_write, votes_skipped = [], 0
-    for v in data["votes"]:
+    for v in seen_votes.values():
         existing = votes_table.get_item(
             Key={"pollId": v["pollId"], "telegramUserId": v["telegramUserId"]}
         ).get("Item")
@@ -379,6 +430,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--session", default="backfill", help="Telethon session file name (default: backfill)")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser("list-chats", help="List every chat this account is in, with message counts")
+    p_list.set_defaults(func=cmd_list_chats)
 
     p_check = sub.add_parser("check", help="Verify MTProto poll.id matches the Bot API pollId already in DynamoDB")
     p_check.add_argument("--chat", required=True, help="Chat id or @username")
